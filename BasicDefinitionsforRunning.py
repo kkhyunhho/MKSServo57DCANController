@@ -1,4 +1,15 @@
-# ---Definition Phase---
+# BasicDefinitionsForRunning.py
+# MKS SERVO57D CAN Motor Controller via USB2CAN (FTDI)
+#
+# Reading Guide:
+#   1. __main__ (bottom)     - Program entry point
+#   2. __init__              - Constants, maps, and response patterns
+#   3. setup_motor           - Motor initialization sequence
+#   4. home_motor            - Homing sequence with limit switch setup
+#   5. send_motor            - Send command and read immediate response
+#   6. wait_response         - Wait for async motor response (motion complete, limit, etc.)
+#   7. interactive_menu      - User interface loop
+#   8. reset_after_limit     - Workaround: motor reset after limit switch stop
 
 import ftd2xx as ftdi
 import time
@@ -7,8 +18,7 @@ class MKSServo:
 
     def __init__(self, dev):
         self.dev = dev
-        self._retry_after_limit = False
-
+        
         self.COMMAND_MAP = {
             "1": ("Absolute Position (mm)", 0xF5,
                   "Format: [Speed(0-100%)] [Accel(0-100%)] [Distance(mm)]\n"
@@ -63,10 +73,6 @@ class MKSServo:
         }
 
         self.RESPONSE_PATTERNS = {
-            "setting": {
-                0x00: "Failed",
-                0x01: "Success",
-            },
             "motion": {
                 0x00: "Failed",
                 0x01: "Running",
@@ -74,25 +80,17 @@ class MKSServo:
                 0x03: "Stopped by Limit Switch",
                 0x05: "Sync Data Received",
             },
+            "setting": {
+                0x00: "Failed",
+                0x01: "Success",
+            },
         }
 
-        # Maps command codes to their response pattern
-        self.CMD_RESPONSE_TYPE = {
-            # Settings (from SETTINGS_MAP + internal usage)
-            0x82: "setting", 0x83: "setting", 0x84: "setting",
-            0x85: "setting", 0x86: "setting", 0x8A: "setting",
-            0x8C: "setting", 0x90: "setting", 0x92: "setting",
-            0xF3: "setting",
-            # Motion (from COMMAND_MAP + internal usage)
-            0x91: "motion", 0xF4: "motion", 0xF5: "motion",
-            0xF6: "motion",
-        }
+        self.MOTION_COMMANDS = {0x91, 0xF4, 0xF5, 0xF6, 0xFD, 0xFE}
+
+        self._retry_after_limit = False
 
     def create_motor_packet(self, can_id, cmd_code, data_list=None):
-    
-        # 0. If data is none, return empty list. Else, use input list
-        if data_list is None:
-            data_list = []
     
         # 1. DLC Calculation: Command + Data + CRC
         dlc = 1 + len(data_list) + 1
@@ -105,76 +103,90 @@ class MKSServo:
         internal_crc = total_sum & 0xFF
 
         # 3. packet Construction
-        packet_content = [cmd_code] + data_list + [internal_crc]
-        while len(packet_content) < 8:
-            packet_content.append(0x00)
+        motor_packet = [cmd_code] + data_list + [internal_crc]
+        while len(motor_packet) < 8:
+            motor_packet.append(0x00)
 
         # print(bytearray(packet_content).hex().upper())
         # print(dlc)
-        return bytearray(packet_content), dlc
+        return bytearray(motor_packet), dlc
     
-    def send_can_message(self, can_id, packet_content, dlc):
+    def send_can_message(self, can_id, motor_packet, dlc, silent=False):
+       
         # STX(1) + Type(1) +DLC(1) + Flags(1) + ID(4) + Data(8) + Checksum(1) + ETX(1) = Total 18byte
 
         packet = bytearray(18)
-        packet[0] = 0x02            # STX
-        packet[1] = 0x00            # Type: Message Packet
-        packet[2] = dlc             # DLC (Range: 0~8)
-        packet[3] = 0x00            # Flags: CAN Standard Data Frame
+        packet[0] = 0x02    # STX
+        packet[1] = 0x00    # Type: Message Packet
+        packet[2] = dlc     # DLC (Range: 0~8)
+        packet[3] = 0x00    # Flags: CAN Standard Data Frame
     
         # ID Setting
         packet[4:8] = can_id.to_bytes(4, 'little') # Endian Format
 
         # Data for Motor Driver
-        for i in range(min(len(packet_content), 8)):
-            packet[8+i] = packet_content[i]
-    
-        packet[16] = sum(packet[1:16]) & 0xFF # CRC
-        packet[17] = 0x03 # ETX
+        for i in range(min(len(motor_packet), 8)):
+            packet[8+i] = motor_packet[i]
+
+        # CRC and ETX
+        packet[16] = sum(packet[1:16]) & 0xFF
+        packet[17] = 0x03
 
         self.dev.write(bytes(packet))
-        print(f"[SENT] CAN ID {can_id}: {packet_content.hex().upper()}")
+        if not silent:
+            print(f"[SENT] CAN ID {can_id}: {motor_packet.hex().upper()}")
 
-    def send_motor(self, can_id, cmd_code, *data_values):
+    def send_motor(self, can_id, cmd_code, *data_values, silent=False):
 
         data_list = list(data_values)
         motor_data, dlc = self.create_motor_packet(can_id, cmd_code, data_list)
+
         if motor_data is None:
             return None
-        self.dev.purge(1)
-        self.send_can_message(can_id, motor_data, dlc)
 
-        time.sleep(0.05)    # Motor Response Stand by
+        self.dev.purge(1) # Clear stale responses before sending new command
+        self.send_can_message(can_id, motor_data, dlc, silent)
+
+        time.sleep(0.05) # Motor Response Stand by
         response = self.dev.read(18)
 
         if len(response) == 18:
             status_byte = response[9]
-            resp_type = self.CMD_RESPONSE_TYPE.get(cmd_code)
-            if resp_type:
+            if not silent:
+                if cmd_code in self.MOTION_COMMANDS:
+                    resp_type = "motion"
+                else:
+                    resp_type = "setting"
                 pattern = self.RESPONSE_PATTERNS[resp_type]
                 status_text = pattern.get(status_byte, f"Unknown (0x{status_byte:02X})")
-            else:
-                status_text = f"0x{status_byte:02X}"
-            print(f"[RESP] 0x{cmd_code:02X}: {status_text}")
+                print(f"[RESP] 0x{cmd_code:02X}: {status_text}")
             return status_byte
-
         else:
             print(f"[TIMEOUT] No Response for 0x{cmd_code:02X}")
             return None
 
     def reset_after_limit(self, can_id):
         print("[LIMIT] Resetting motor after limit switch stop...")
-        self.send_motor(can_id, 0xF3, 0x00)  # Disable
-        self.send_motor(can_id, 0xF3, 0x01)  # Re-enable
-        time.sleep(0.3)
-        self.dev.purge(1)
-        self._retry_after_limit = True
+
+        # Reset by Disable and Re-enable
+        self.send_motor(can_id, 0xF3, 0x00, silent=True)
+        self.send_motor(can_id, 0xF3, 0x01, silent=True)
+
+        time.sleep(0.3) # Wait for motor to stabilize after re-enable
+        self.dev.purge(1) # Clear F3 responses before next move command
+        self._retry_after_limit = True # Refer interactive_menu(): # 5.
+
         print("[LIMIT] Motor re-enabled. Ready to move.")
 
-    def wait_response(self, can_id=None, timeout=5):
+    def wait_response(self, can_id, timeout=5, auto_reset=True):
         print("[WAIT] Waiting for Motor Response...")
+        MAX_TIMEOUT = 120
+        abs_start = time.time()
         start = time.time()
         while time.time() - start < timeout:
+            if time.time() - abs_start > MAX_TIMEOUT:
+                print("[TIMEOUT] Max timeout reached.")
+                return None
             response = self.dev.read(18)
             if len(response) == 18:
                 cmd = response[8]
@@ -182,10 +194,12 @@ class MKSServo:
                 motion_pattern = self.RESPONSE_PATTERNS["motion"]
                 status_text = motion_pattern.get(status, f"Unknown (0x{status:02X})")
                 print(f"[RECV] CMD: 0x{cmd:02X}, Status: {status_text}")
-                if status != 0x01:  # 0x01 = still running, keep waiting
-                    if status == 0x03 and can_id is not None:
-                        self.reset_after_limit(can_id)
-                    return status
+                if status == 0x01:
+                    start = time.time() # Reset timer while motor is running
+                    continue
+                if status == 0x03 and auto_reset:
+                    self.reset_after_limit(can_id)
+                return status # result can be None if it has been [TIMEOUT]
             time.sleep(0.1)
         print("[TIMEOUT] No Response Received.")
         return None
@@ -211,7 +225,7 @@ class MKSServo:
 
         return all_ok
 
-    def home_motor(self, can_id, home_speed=60):
+    def home_motor(self, can_id, home_speed=90):
         print(f"\n{'='*45}")
         print("[HOME] Starting Homing Sequence...")
         print(f"{'='*45}")
@@ -234,7 +248,7 @@ class MKSServo:
         # 3. Wait for homing to complete
         # NOTE: Dir inverted — homeDir=0x01 actually moves CW on this motor
         print("[HOME] Moving to find origin switch...")
-        status = self.wait_response(timeout=30)
+        status = self.wait_response(can_id, timeout=30, auto_reset=False)
 
         if status == 0x02:
             print("[HOME] Homing Complete. Zero point set.")
@@ -377,7 +391,7 @@ class MKSServo:
 
             # Special: Homing Speed
             if choice == "10":
-                rpm_raw = safe_input(">> Enter Homing Speed (RPM, default 60): ")
+                rpm_raw = safe_input(">> Enter Homing Speed (RPM, default 90): ")
                 if not rpm_raw:
                     rpm_raw = "60"
                 try:
@@ -389,7 +403,7 @@ class MKSServo:
 
             # Special: Run Homing
             if choice == "11":
-                speed = getattr(self, 'homing_speed', 60)
+                speed = getattr(self, 'homing_speed', 90)
                 self.home_motor(can_id, home_speed=speed)
                 continue
 
@@ -528,17 +542,21 @@ class MKSServo:
                 self.send_motor(id_input, cmd_code, *data_values)
 
                 # 5. Wait for Completion (If YY==1)
-                if cmd_code in (0x91, 0xF6, 0xF4, 0xF5,  0xFD, 0xFE):
+                if cmd_code in (0x91, 0xF6, 0xF4, 0xF5, 0xFD, 0xFE):
                     # 91H: Hm Restoration, F6H: Speed Control
                     # F4H: Coord relativ running, F5H: Coord abs running
                     # FDH: Pulse relativ running, FEH: Pulse abs running
-                    result = self.wait_response(can_id=id_input)
+                    if self._retry_after_limit:
+                        result = self.wait_response(can_id=id_input, timeout=1)
+                    else:
+                        result = self.wait_response(can_id=id_input)
 
                     # Auto-retry once if timed out after limit reset
                     if result is None and self._retry_after_limit:
+                        # result can be None if it has been [TIMEOUT]
                         self._retry_after_limit = False
                         print("[RETRY] Re-sending command after limit reset...")
-                        self.dev.purge(1)
+                        self.dev.purge(1)  # Clear timed-out response before retry
                         self.send_motor(id_input, cmd_code, *data_values)
                         self.wait_response(can_id=id_input)
 
@@ -559,10 +577,11 @@ if __name__ == "__main__":
         motor = MKSServo(dev)
 
         CAN_ID = 0x01
-        motor.setup_motor(CAN_ID)
-        motor.home_motor(CAN_ID)
-
-        motor.interactive_menu()
+        if not motor.setup_motor(CAN_ID):
+            print("[ERROR] Setup failed. Exiting.")
+        else:
+            motor.home_motor(CAN_ID)
+            motor.interactive_menu()
     
     except Exception as e:
         print(f"[ERROR] Connection Failed: {e}")
