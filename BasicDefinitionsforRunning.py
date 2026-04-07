@@ -67,7 +67,7 @@ class MKSServo:
                 "1": ("Active High", 0x01),
                 "2": ("Always Enabled (Hold)", 0x02),
             }),
-            "10": ("Set Homing Speed [Default: 60 RPM]", None, None),
+            "10": ("Set Homing Speed [Default: 90 RPM]", None, None),
             "11": ("Run Homing", None, None),
             "12": ("Read Motor Operating Status", 0xF1, None),
         }
@@ -178,9 +178,9 @@ class MKSServo:
 
         print("[LIMIT] Motor re-enabled. Ready to move.")
 
-    def wait_response(self, can_id, timeout=5, auto_reset=True):
+    def wait_response(self, can_id, timeout=1, auto_reset=True):
         print("[WAIT] Waiting for Motor Response...")
-        MAX_TIMEOUT = 120
+        MAX_TIMEOUT = 60
         abs_start = time.time()
         start = time.time()
         while time.time() - start < timeout:
@@ -200,7 +200,7 @@ class MKSServo:
                 if status == 0x03 and auto_reset:
                     self.reset_after_limit(can_id)
                 return status # result can be None if it has been [TIMEOUT]
-            time.sleep(0.1)
+            time.sleep(0.1)  # Delay before next read attempt
         print("[TIMEOUT] No Response Received.")
         return None
 
@@ -226,9 +226,7 @@ class MKSServo:
         return all_ok
 
     def home_motor(self, can_id, home_speed=90):
-        print(f"\n{'='*45}")
-        print("[HOME] Starting Homing Sequence...")
-        print(f"{'='*45}")
+        print(f"\n{'='*45}\n[HOME] Starting Homing Sequence...\n{'='*45}")
 
         # 1. Set homing params (90H)
         #    homeTrig=0x00 (Low level), homeDir=0x01 (CCW),
@@ -393,7 +391,7 @@ class MKSServo:
             if choice == "10":
                 rpm_raw = safe_input(">> Enter Homing Speed (RPM, default 90): ")
                 if not rpm_raw:
-                    rpm_raw = "60"
+                    rpm_raw = "90"
                 try:
                     self.homing_speed = int(rpm_raw)
                     print(f"[OK] Homing speed set to {self.homing_speed} RPM")
@@ -546,14 +544,10 @@ class MKSServo:
                     # 91H: Hm Restoration, F6H: Speed Control
                     # F4H: Coord relativ running, F5H: Coord abs running
                     # FDH: Pulse relativ running, FEH: Pulse abs running
-                    if self._retry_after_limit:
-                        result = self.wait_response(can_id=id_input, timeout=1)
-                    else:
-                        result = self.wait_response(can_id=id_input)
+                    result = self.wait_response(can_id=id_input)
 
                     # Auto-retry once if timed out after limit reset
                     if result is None and self._retry_after_limit:
-                        # result can be None if it has been [TIMEOUT]
                         self._retry_after_limit = False
                         print("[RETRY] Re-sending command after limit reset...")
                         self.dev.purge(1)  # Clear timed-out response before retry
