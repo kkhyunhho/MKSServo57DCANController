@@ -9,7 +9,7 @@
 #   1. __main__          - Entry point: open FTDI, setup, home, menu
 #   2. send / wait       - Core CAN communication
 #   3. setup / home      - Motor initialization sequences
-#   4. move_to / spin    - High-level motion commands
+#   4. move_to           - High-level motion commands
 #   5. interactive_menu  - User interface
 
 import time
@@ -19,18 +19,18 @@ import ftd2xx as ftdi
 
 # --- Constants ---
 
-MM_PER_TURN = 3.75          # Ball screw pitch
-ENCODER_PER_TURN = 16384    # 16384 encoder counts = 360 degrees
-MAX_SPEED_RPM = 3000
-MAX_ACCEL = 255
-MAX_COORD = 8388607         # int24 max
-MAX_TRAVEL_MM = 450         # Ball screw physical limit
-MAX_WAIT_SEC = 10   # 250   # Max wait for motor response (1% speed full travel ≈ 240s)
+mm_per_turn = 3.75          # Ball screw pitch
+encoder_per_turn = 16384    # 16384 encoder counts = 360 degrees
+max_speed_rpm = 3000
+max_accel = 255
+max_coord = 8388607         # int24 max
+max_travel_mm = 450         # Ball screw physical limit
+max_wait_sec = 250          # Max wait for motor response (1% speed full travel ≈ 240s)
 
 # Commands that trigger async motor responses (motion in progress -> complete)
-MOTION_CMDS = {0x91, 0xF4, 0xF5, 0xF6, 0xFD, 0xFE}
+motion_cmds = {0x91, 0xF4, 0xF5, 0xF6, 0xFD, 0xFE}
 
-MOTION_STATUS = {
+motion_status = {
     0x00: "Failed",
     0x01: "Running",
     0x02: "Complete",
@@ -38,42 +38,121 @@ MOTION_STATUS = {
     0x05: "Sync Data Received",
 }
 
-SETTING_STATUS = {
+setting_status = {
     0x00: "Failed",
     0x01: "Success",
 }
 
 def clamp(value, low, high):
+    """Enforce that value is within [low, high].
+
+    Args:
+        value: Number to check.
+        low: Lower bound (inclusive).
+        high: Upper bound (inclusive).
+
+    Returns:
+        The original value if within range.
+
+    Raises:
+        ValueError: If value is outside [low, high].
+    """
     if value < low or value > high:
-        raise ValueError(f"Value {value} out of range [{low}, {high}]")
+        raise ValueError(
+            f"Value {value} out of range [{low}, {high}]"
+        )
     return value
 
 
 def pct_to_speed(pct):
-    """Convert 0-100% to 0-3000 RPM."""
-    return int(MAX_SPEED_RPM * clamp(pct, 0, 100) / 100)
+    """Convert 0-100% to 0-3000 RPM.
+
+    Args:
+        pct: Speed percentage (0-100).
+
+    Returns:
+        Integer RPM value.
+
+    Raises:
+        ValueError: If pct is outside [0, 100].
+    """
+    return int(max_speed_rpm * clamp(pct, 0, 100) / 100)
 
 
 def pct_to_accel(pct):
-    """Convert 0-100% to 0-255."""
-    return int(MAX_ACCEL * clamp(pct, 0, 100) / 100)
+    """Convert 0-100% to 0-255.
+
+    Args:
+        pct: Acceleration percentage (0-100).
+
+    Returns:
+        Integer acceleration value (0-255).
+
+    Raises:
+        ValueError: If pct is outside [0, 100].
+    """
+    return int(max_accel * clamp(pct, 0, 100) / 100)
 
 
 def mm_to_coord(mm):
-    """Convert mm distance to encoder coordinate value."""
-    coord = int(clamp(mm, 0, MAX_TRAVEL_MM) / MM_PER_TURN * ENCODER_PER_TURN)
+    """Convert mm distance to encoder coordinate value.
+
+    Args:
+        mm: Distance in millimeters (0 to max_travel_mm).
+
+    Returns:
+        Integer encoder count for the given distance.
+
+    Raises:
+        ValueError: If mm is outside [0, max_travel_mm].
+    """
+    coord = int(
+        clamp(mm, 0, max_travel_mm)
+        / mm_per_turn * encoder_per_turn
+    )
     return coord
 
 
 def int16_bytes(value):
-    """Split uint16 into [high, low] bytes."""
+    """Split uint16 into [high, low] bytes.
+
+    Args:
+        value: Unsigned 16-bit integer.
+
+    Returns:
+        List of two bytes [high, low].
+    """
     return [(value >> 8) & 0xFF, value & 0xFF]
 
 
 def int24_bytes(value):
-    """Split int24 into [high, mid, low] bytes."""
+    """Split int24 into [high, mid, low] bytes.
+
+    Args:
+        value: 24-bit integer.
+
+    Returns:
+        List of three bytes [high, mid, low].
+    """
     v = value & 0xFFFFFF
     return [(v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF]
+
+
+def open_device(port=0):
+    """Open and configure FTDI USB2CAN device.
+
+    Args:
+        port: FTDI device index (default 0).
+
+    Returns:
+        Configured ftd2xx device handle.
+    """
+    dev = ftdi.open(port)
+    dev.setBitMode(0xFF, 0x40)  # FT245 synchronous FIFO mode
+    dev.setTimeouts(100, 100)
+    dev.purge(1 | 2)
+    time.sleep(0.1)
+    return dev
 
 
 # --- Motor Controller ---
@@ -88,10 +167,23 @@ class MKSMotor:
     # ---- Low-level: CAN packet over USB2CAN ----
 
     def send(self, cmd, *data, silent=False):
-        """Send a CAN command and return the immediate response status byte.
+        """Send a CAN command and return the response status.
 
-        Builds: [cmd] [data...] [checksum] padded to 8 bytes (MKS motor protocol),
+        Builds [cmd][data...][checksum] padded to 8 bytes,
         then wraps it in an 18-byte USB2CAN binary packet.
+
+        Args:
+            cmd: MKS command code (e.g. 0xF5).
+            *data: Variable-length data bytes.
+            silent: Suppress TX/RX logging if True.
+
+        Returns:
+            Status byte from the motor response,
+            or None if broadcast or no response.
+
+        Raises:
+            ConnectionError: If no valid response
+                after retries.
         """
         data = list(data)
         dlc = 1 + len(data) + 1  # cmd + data + checksum
@@ -137,47 +229,51 @@ class MKSMotor:
             self.dev.purge(1)
 
         if len(resp) != 18:
-            raise ConnectionError(f"No response for 0x{cmd:02X} -- check CAN wiring, power, and bitrate")
+            raise ConnectionError(
+            f"No response for 0x{cmd:02X}"
+            " -- check CAN wiring, power, and bitrate"
+        )
 
         status = resp[9]
         if not silent:
-            if cmd in MOTION_CMDS:
-                table = MOTION_STATUS
+            if cmd in motion_cmds:
+                table = motion_status
             else:
-                table = SETTING_STATUS
+                table = setting_status
             print(f"[RX] {table.get(status, f'Unknown 0x{status:02X}')}")
         return status
 
 
     def wait(self):
-        """Wait for async motor response (motion complete, limit hit, etc.).
+        """Wait for async motor response.
 
-        Uses MAX_WAIT_SEC. Resets each time a Running response arrives.
+        Blocks until the motor reports completion,
+        failure, or limit hit. Timeout resets each
+        time a "Running" response arrives.
+
+        Returns:
+            Status byte (0x02=complete, 0x03=limit,
+            etc.), or None on timeout.
         """
-        deadline = time.time() + MAX_WAIT_SEC
+        deadline = time.time() + max_wait_sec
 
         while time.time() < deadline:
             resp = self.dev.read(18)
             if len(resp) == 18:
                 status = resp[9]
-                print(f"[RX] {MOTION_STATUS.get(status, f'0x{status:02X}')}")
+                print(f"[RX] {motion_status.get(status, f'0x{status:02X}')}")
 
                 if status == 0x01:      # Still running -- keep waiting
-                    deadline = time.time() + MAX_WAIT_SEC
+                    deadline = time.time() + max_wait_sec
                     continue
                 if status == 0x03:
                     print("[LIMIT] Motor stopped by limit switch")
-                    # Re-enable motor and clear buffer so next command works
-                    self.send(0xF3, 0x00, silent=True)  # Disable
-                    self.send(0xF3, 0x01, silent=True)  # Enable
-                    time.sleep(0.5)
-                    while len(self.dev.read(18)) == 18:
-                        pass
-                    self.dev.purge(1)
-                    # Dummy move: firmware ignores first motion after re-enable
+                    # Dummy move: firmware ignores first motion after limit stop
                     # Use F4H (relative) with tiny distance so it works regardless
                     # of current position
-                    coord = int(0.01 / MM_PER_TURN * ENCODER_PER_TURN)
+                    time.sleep(0.5)
+                    self.dev.purge(1)
+                    coord = int(0.01 / mm_per_turn * encoder_per_turn)
                     dummy = int16_bytes(300) + [0] + int24_bytes(coord)
                     self.send(0xF4, *dummy, silent=True)
                     time.sleep(0.5)
@@ -192,7 +288,13 @@ class MKSMotor:
     # ---- Setup & Homing ----
 
     def setup(self):
-        """Apply default motor settings: SR_vFOC mode, full response."""
+        """Apply default motor settings.
+
+        Configures SR_vFOC mode and full slave response.
+
+        Returns:
+            True if all settings applied, False otherwise.
+        """
         commands = [
             (0x82, [0x05]),         # SR_vFOC mode
             (0x8C, [0x01, 0x01]),   # Full slave response (XX=1, YY=1)
@@ -209,11 +311,18 @@ class MKSMotor:
         return ok
 
     def home(self, speed_rpm=90):
-        """Run homing sequence: find origin switch, then enable limit switches.
+        """Run homing sequence and enable limit switches.
 
-        HARDWARE NOTE: Motor direction is physically inverted due to wiring/mounting.
-        Manual says 0x00=CW, 0x01=CCW, but actual movement is opposite.
-        All direction values in this method are swapped accordingly.
+        Finds the origin switch, sets the zero point,
+        then enables limit switches for safe operation.
+
+        HARDWARE NOTE: Motor direction is physically
+        inverted due to wiring/mounting. Manual says
+        0x00=CW, 0x01=CCW, but actual movement is
+        opposite. Direction values are swapped here.
+
+        Args:
+            speed_rpm: Homing speed in RPM (default 90).
         """
         print(f"{'='*40}\nHOMING (speed={speed_rpm} RPM)\n{'='*40}")
         spd = int16_bytes(speed_rpm)
@@ -233,7 +342,7 @@ class MKSMotor:
             print("Limit switches enabled.")
 
             # Dummy move: firmware ignores first motion after limit enable/re-enable
-            coord = int(0.01 / MM_PER_TURN * ENCODER_PER_TURN)
+            coord = int(0.01 / mm_per_turn * encoder_per_turn)
             dummy = int16_bytes(300) + [0] + int24_bytes(coord)
             self.send(0xF5, *dummy, silent=True)
             time.sleep(0.5)
@@ -246,17 +355,27 @@ class MKSMotor:
     # ---- High-level motion ----
 
     def move_to(self, mm, speed_pct=20, accel_pct=10):
-        """Move to absolute position in mm (F5H command).
+        """Move to absolute position in mm.
 
-        Uses coordinate-based absolute motion (manual section 11.4).
-        Ball screw converts mm -> encoder counts.
+        Uses F5H coordinate-based absolute motion
+        (manual section 11.4). Ball screw converts
+        mm to encoder counts.
+
+        Args:
+            mm: Target position in millimeters.
+            speed_pct: Speed as 0-100% of max RPM.
+            accel_pct: Acceleration as 0-100% of max.
         """
         spd = pct_to_speed(speed_pct)
         acc = pct_to_accel(accel_pct)
         coord = mm_to_coord(mm)
 
         data = int16_bytes(spd) + [acc] + int24_bytes(coord)
-        print(f"  Moving to {mm}mm (speed={spd}RPM, accel={acc}, coord=0x{coord:06X})")
+        print(
+            f"  Moving to {mm}mm"
+            f" (speed={spd}RPM, accel={acc},"
+            f" coord=0x{coord:06X})"
+        )
 
         self._send_and_wait(0xF5, data)
 
@@ -276,16 +395,24 @@ class MKSMotor:
     # ---- Interactive Menu ----
 
     def interactive_menu(self):
-        """Text-based control interface."""
+        """Run the text-based motor control interface.
+
+        Loops until the user types 'exit'.
+        """
         while True:
             try:
-                print(f'\n{"="*40}\n  Motor Control  |  CAN ID: 0x{self.can_id:02X}\n{"="*40}')
+                header = (
+                    f'{"="*40}\n'
+                    f'  Motor Control  |'
+                    f'  CAN ID: 0x{self.can_id:02X}\n'
+                    f'{"="*40}'
+                )
+                print(header)
                 print("  1. Move to position (mm)")
                 print("  2. Settings")
                 print("  3. Manual command (hex)")
                 print("  ────────────────────────")
                 print("  0. Re-run setup")
-                print("  id. Change CAN ID")
                 print("  exit. Quit")
 
                 choice = input(">> ").strip()
@@ -298,8 +425,6 @@ class MKSMotor:
                     self._menu_manual()
                 elif choice == "0":
                     self.setup()
-                elif choice.lower() == "id":
-                    self._menu_change_id()
                 elif choice.lower() == "exit":
                     break
                 else:
@@ -323,7 +448,7 @@ class MKSMotor:
             print(f"[INPUT] {e}")
 
     def _menu_settings(self):
-        SETTINGS = [
+        settings = [
             # Motion
             ("Run homing",      lambda: self.home(
                 speed_rpm=int(input("  Homing speed RPM [90]: ") or "90"))),
@@ -332,11 +457,10 @@ class MKSMotor:
             ("Disable motor",   lambda: self.send(0xF3, 0x00)),
             # Diagnostics
             ("Read status",     lambda: self.send(0xF1)),
-            ("Emergency stop",  lambda: self.send(0xF7)),
         ]
         while True:
             print(f'\n{"-"*40}\n  Settings\n{"-"*40}')
-            for i, (name, _) in enumerate(SETTINGS, 1):
+            for i, (name, _) in enumerate(settings, 1):
                 print(f"  {i}. {name}")
             print("  0. Back")
 
@@ -345,8 +469,8 @@ class MKSMotor:
                 return
             try:
                 idx = int(choice) - 1
-                if 0 <= idx < len(SETTINGS):
-                    SETTINGS[idx][1]()
+                if 0 <= idx < len(settings):
+                    settings[idx][1]()
                 else:
                     print("[INPUT] Invalid choice")
             except (ValueError, Exception) as e:
@@ -360,50 +484,15 @@ class MKSMotor:
                 data = [int(x, 16) for x in d_raw.split()]
             else:
                 data = []
-            self.send(cmd, *data)
-            if cmd in MOTION_CMDS:
-                self.wait()
-        except ValueError:
-            print("[INPUT] Invalid hex")
-
-    def _menu_change_id(self):
-        raw = input(f"  New CAN ID (hex, current=0x{self.can_id:02X}): ")
-        try:
-            new_id = int(raw, 16)
-            if not (0x01 <= new_id <= 0x7FF):
-                print("[INPUT] CAN ID range: 0x01 ~ 0x7FF")
-                return
-            self.can_id = new_id
-            print(f"  CAN ID changed to 0x{self.can_id:02X}")
+            if cmd in motion_cmds:
+                self._send_and_wait(cmd, data)
+            else:
+                self.send(cmd, *data)
         except ValueError:
             print("[INPUT] Invalid hex")
 
 
 # --- Entry Point ---
-
-def open_device():
-    """Open and configure FTDI USB2CAN device."""
-    dev = ftdi.open(0)
-    dev.setBitMode(0xFF, 0x40)  # FT245 synchronous FIFO mode
-    dev.setTimeouts(100, 100)
-    dev.purge(1 | 2)
-    time.sleep(0.1)
-    return dev
-
-
-def reset_device(dev):
-    """Reset FTDI device to recover from CAN Bus-Off state."""
-    print("[RESET] Resetting USB2CAN adapter...")
-    try:
-        dev.setBitMode(0x00, 0x00)  # Reset mode
-        time.sleep(0.3)
-        dev.setBitMode(0xFF, 0x40)  # Back to FIFO mode
-        dev.purge(1 | 2)
-        time.sleep(0.3)
-        print("[RESET] Done")
-    except Exception:
-        print("[RESET] Failed -- try unplugging USB")
-
 
 if __name__ == "__main__":
     dev = None
@@ -411,23 +500,10 @@ if __name__ == "__main__":
         dev = open_device()
         motor = MKSMotor(dev, can_id=0x01)
 
-        # Try setup with automatic recovery on failure
-        for attempt in range(3):
-            try:
-                if motor.setup():
-                    motor.home()
-                    break
-                else:
-                    print("[WARN] Setup failed")
-                    if attempt < 2:
-                        reset_device(dev)
-            except ConnectionError as e:
-                print(f"[ERROR] {e}")
-                if attempt < 2:
-                    reset_device(dev)
+        if motor.setup():
+            motor.home()
         else:
-            print("[WARN] Setup failed after 3 attempts -- entering menu")
-
+            print("[WARN] Setup failed -- entering menu for manual setup")
         motor.interactive_menu()
 
     except Exception as e:
