@@ -1,3 +1,5 @@
+<!-- Source: https://github.com/coport-uni/CommonClaude/blob/main/CLAUDE.md -->
+
 # CommonClaude.md
 
 This file contains the project-wide conventions that **all Claude Code sessions** must follow when working in this repository.
