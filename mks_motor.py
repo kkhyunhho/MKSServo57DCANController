@@ -23,17 +23,35 @@ class MKSMotor:
 
     # --- Constants ---
 
-    mm_per_turn = 3.75
-    encoder_per_turn = 16384
-    max_speed_rpm = 3000
-    max_accel = 255
-    max_coord = 8388607
-    max_travel_mm = 450
-    max_wait_sec = 250
+    # Mechanical / motor limits
+    _mm_per_turn = 3.75
+    _encoder_per_turn = 16384
+    _max_speed_rpm = 3000
+    _max_accel = 255
+    _max_travel_mm = 450
+    _max_wait_sec = 250
 
-    motion_cmds = {0x91, 0xF4, 0xF5, 0xF6, 0xFD, 0xFE}
+    # FTDI device setup (USB2CAN-FIFO adapter)
+    _ftdi_bitmode_mask = 0xFF
+    _ftdi_bitmode_async = 0x40
+    _ftdi_read_timeout_ms = 100
+    _ftdi_write_timeout_ms = 100
+    _ftdi_purge_rx_tx = 1 | 2
 
-    motion_status = {
+    # CAN response read retry policy
+    _response_retry_count = 5
+    _response_retry_delay_s = 0.05
+
+    # Limit-stop recovery: the MKS firmware ignores the
+    # first motion command after a limit stop, so a tiny
+    # dummy move is issued to consume that skip.
+    _limit_recover_delay_s = 0.5
+    _dummy_move_offset_mm = 0.01
+    _dummy_move_speed_rpm = 300
+
+    _motion_cmds = {0x91, 0xF4, 0xF5, 0xF6, 0xFD, 0xFE}
+
+    _motion_status = {
         0x00: "Failed",
         0x01: "Running",
         0x02: "Complete",
@@ -41,7 +59,7 @@ class MKSMotor:
         0x05: "Sync Data Received",
     }
 
-    setting_status = {
+    _setting_status = {
         0x00: "Failed",
         0x01: "Success",
     }
@@ -64,9 +82,9 @@ class MKSMotor:
             Configured MKSMotor instance.
         """
         dev = ftdi.open(port)
-        dev.setBitMode(0xFF, 0x40)
-        dev.setTimeouts(100, 100)
-        dev.purge(1 | 2)
+        dev.setBitMode(cls._ftdi_bitmode_mask, cls._ftdi_bitmode_async)
+        dev.setTimeouts(cls._ftdi_read_timeout_ms, cls._ftdi_write_timeout_ms)
+        dev.purge(cls._ftdi_purge_rx_tx)
         time.sleep(0.1)
         return cls(dev, can_id)
 
@@ -122,17 +140,19 @@ class MKSMotor:
         Returns:
             List of three bytes [high, mid, low].
         """
-        v = value & 0xFFFFFF
+        value_24bit = value & 0xFFFFFF
         return [
-            (v >> 16) & 0xFF,
-            (v >> 8) & 0xFF,
-            v & 0xFF,
+            (value_24bit >> 16) & 0xFF,
+            (value_24bit >> 8) & 0xFF,
+            value_24bit & 0xFF,
         ]
 
     # --- Unit conversions ---
 
     def _pct_to_speed(self, pct):
-        """Convert 0-100% to 0-3000 RPM.
+        """Convert percentage to motor RPM.
+
+        Maps 0-100% linearly onto [0, _max_speed_rpm].
 
         Args:
             pct: Speed percentage (0-100).
@@ -144,24 +164,26 @@ class MKSMotor:
             ValueError: If pct is outside [0, 100].
         """
         return int(
-            self.max_speed_rpm
+            self._max_speed_rpm
             * self._clamp(pct, 0, 100) / 100
         )
 
     def _pct_to_accel(self, pct):
-        """Convert 0-100% to 0-255.
+        """Convert percentage to motor acceleration.
+
+        Maps 0-100% linearly onto [0, _max_accel].
 
         Args:
             pct: Acceleration percentage (0-100).
 
         Returns:
-            Integer acceleration value (0-255).
+            Integer acceleration value.
 
         Raises:
             ValueError: If pct is outside [0, 100].
         """
         return int(
-            self.max_accel
+            self._max_accel
             * self._clamp(pct, 0, 100) / 100
         )
 
@@ -176,11 +198,11 @@ class MKSMotor:
 
         Raises:
             ValueError: If mm is outside
-                [0, max_travel_mm].
+                [0, _max_travel_mm].
         """
         coord = int(
-            self._clamp(mm, 0, self.max_travel_mm)
-            / self.mm_per_turn * self.encoder_per_turn
+            self._clamp(mm, 0, self._max_travel_mm)
+            / self._mm_per_turn * self._encoder_per_turn
         )
         return coord
 
@@ -205,8 +227,8 @@ class MKSMotor:
             ConnectionError: If no valid response
                 after retries.
         """
-        data = list(data)
-        dlc = 1 + len(data) + 1
+        data_bytes = list(data)
+        dlc = 1 + len(data_bytes) + 1
         if dlc > 8:
             print(
                 f"[ERROR] Too much data"
@@ -215,33 +237,32 @@ class MKSMotor:
             return None
 
         checksum = (
-            self.can_id + cmd + sum(data)
+            self.can_id + cmd + sum(data_bytes)
         ) & 0xFF
-        motor_bytes = [cmd] + data + [checksum]
+        motor_bytes = [cmd] + data_bytes + [checksum]
         motor_bytes += [0x00] * (8 - len(motor_bytes))
 
         # USB2CAN binary packet (18 bytes total)
         # See USB2CAN manual section 3.2.2
-        pkt = bytearray(18)
-        pkt[0] = 0x02                        # STX
-        pkt[1] = 0x00                        # Type
-        pkt[2] = dlc                         # DLC
-        pkt[3] = 0x00                        # Flags
-        pkt[4:8] = self.can_id.to_bytes(     # CAN ID
+        packet = bytearray(18)
+        packet[0] = 0x02                        # STX
+        packet[1] = 0x00                        # Type
+        packet[2] = dlc                         # DLC
+        packet[3] = 0x00                        # Flags
+        packet[4:8] = self.can_id.to_bytes(     # CAN ID
             4, 'little'
         )
-        pkt[8:16] = bytes(motor_bytes)       # Data
-        pkt[16] = sum(pkt[1:16]) & 0xFF      # Checksum
-        pkt[17] = 0x03                       # ETX
+        packet[8:16] = bytes(motor_bytes)       # Data
+        packet[16] = sum(packet[1:16]) & 0xFF   # Checksum
+        packet[17] = 0x03                       # ETX
 
         self.dev.purge(1)
-        self.dev.write(bytes(pkt))
+        self.dev.write(bytes(packet))
         if not silent:
-            print(
-                f"[TX] 0x{cmd:02X} "
-                f"{bytes(data).hex().upper()
-                   or '(no data)'}"
+            data_hex = (
+                bytes(data_bytes).hex().upper() or '(no data)'
             )
+            print(f"[TX] 0x{cmd:02X} {data_hex}")
 
         if self.can_id == 0x00:
             if not silent:
@@ -252,8 +273,8 @@ class MKSMotor:
             return None
 
         resp = b''
-        for attempt in range(5):
-            time.sleep(0.05)
+        for _ in range(self._response_retry_count):
+            time.sleep(self._response_retry_delay_s)
             resp = self.dev.read(18)
             if len(resp) == 18:
                 break
@@ -268,15 +289,14 @@ class MKSMotor:
 
         status = resp[9]
         if not silent:
-            if cmd in self.motion_cmds:
-                table = self.motion_status
+            if cmd in self._motion_cmds:
+                table = self._motion_status
             else:
-                table = self.setting_status
-            print(
-                f"[RX] "
-                f"{table.get(status,
-                             f'Unknown 0x{status:02X}')}"
+                table = self._setting_status
+            status_label = table.get(
+                status, f'Unknown 0x{status:02X}'
             )
+            print(f"[RX] {status_label}")
         return status
 
     def _wait(self):
@@ -295,20 +315,20 @@ class MKSMotor:
             Status byte (0x02=complete, 0x03=limit,
             etc.), or None on timeout.
         """
-        deadline = time.time() + self.max_wait_sec
+        deadline = time.time() + self._max_wait_sec
 
         while time.time() < deadline:
             resp = self.dev.read(18)
             if len(resp) == 18:
                 status = resp[9]
-                label = self.motion_status.get(
+                label = self._motion_status.get(
                     status, f'0x{status:02X}'
                 )
                 print(f"[RX] {label}")
 
                 if status == 0x01:
                     deadline = (
-                        time.time() + self.max_wait_sec
+                        time.time() + self._max_wait_sec
                     )
                     continue
                 if status == 0x03:
@@ -316,22 +336,24 @@ class MKSMotor:
                         "[LIMIT] Motor stopped"
                         " by limit switch"
                     )
-                    time.sleep(0.5)
+                    time.sleep(self._limit_recover_delay_s)
                     self.dev.purge(1)
                     coord = int(
-                        0.01
-                        / self.mm_per_turn
-                        * self.encoder_per_turn
+                        self._dummy_move_offset_mm
+                        / self._mm_per_turn
+                        * self._encoder_per_turn
                     )
                     dummy = (
-                        self._int16_bytes(300)
+                        self._int16_bytes(
+                            self._dummy_move_speed_rpm
+                        )
                         + [0]
                         + self._int24_bytes(coord)
                     )
                     self._send(
                         0xF4, *dummy, silent=True
                     )
-                    time.sleep(0.5)
+                    time.sleep(self._limit_recover_delay_s)
                     self.dev.purge(1)
                 return status
 
@@ -359,8 +381,8 @@ class MKSMotor:
             (0x8C, [0x01, 0x01]),
         ]
         ok = True
-        for cmd, d in commands:
-            if self._send(cmd, *d, silent=True) != 0x01:
+        for cmd, data in commands:
+            if self._send(cmd, *data, silent=True) != 0x01:
                 ok = False
 
         if ok:
@@ -388,9 +410,11 @@ class MKSMotor:
             f"HOMING (speed={speed_rpm} RPM)\n"
             f"{'='*40}"
         )
-        spd = self._int16_bytes(speed_rpm)
+        speed_bytes = self._int16_bytes(speed_rpm)
 
-        self._send(0x90, 0x00, 0x01, *spd, 0x00, 0x00)
+        self._send(
+            0x90, 0x00, 0x01, *speed_bytes, 0x00, 0x00
+        )
 
         self._send(0x91)
         print("Moving toward origin switch...")
@@ -399,22 +423,22 @@ class MKSMotor:
         if status == 0x02:
             print("Homing complete. Zero point set.")
             self._send(
-                0x90, 0x00, 0x01, *spd, 0x01, 0x00
+                0x90, 0x00, 0x01, *speed_bytes, 0x01, 0x00
             )
             print("Limit switches enabled.")
 
             coord = int(
-                0.01
-                / self.mm_per_turn
-                * self.encoder_per_turn
+                self._dummy_move_offset_mm
+                / self._mm_per_turn
+                * self._encoder_per_turn
             )
             dummy = (
-                self._int16_bytes(300)
+                self._int16_bytes(self._dummy_move_speed_rpm)
                 + [0]
                 + self._int24_bytes(coord)
             )
             self._send(0xF5, *dummy, silent=True)
-            time.sleep(0.5)
+            time.sleep(self._limit_recover_delay_s)
             self.dev.purge(1)
         elif status == 0x00:
             print("Homing FAILED. Check switch wiring.")
@@ -435,22 +459,22 @@ class MKSMotor:
             speed_pct: Speed as 0-100% of max RPM.
             accel_pct: Acceleration as 0-100% of max.
         """
-        spd = self._pct_to_speed(speed_pct)
-        acc = self._pct_to_accel(accel_pct)
+        speed = self._pct_to_speed(speed_pct)
+        accel = self._pct_to_accel(accel_pct)
         coord = self._mm_to_coord(mm)
 
-        data = (
-            self._int16_bytes(spd)
-            + [acc]
+        motion_data = (
+            self._int16_bytes(speed)
+            + [accel]
             + self._int24_bytes(coord)
         )
         print(
             f"  Moving to {mm}mm"
-            f" (speed={spd}RPM, accel={acc},"
+            f" (speed={speed}RPM, accel={accel},"
             f" coord=0x{coord:06X})"
         )
 
-        initial = self._send(0xF5, *data)
+        initial = self._send(0xF5, *motion_data)
 
         if initial == 0x01:
             return self._wait()
@@ -479,7 +503,7 @@ class MKSMotor:
         Returns:
             Status byte from motor response.
         """
-        if cmd in self.motion_cmds:
+        if cmd in self._motion_cmds:
             initial = self._send(cmd, *data)
             if initial == 0x01:
                 return self._wait()
