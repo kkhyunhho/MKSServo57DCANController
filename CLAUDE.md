@@ -26,8 +26,8 @@ single axis, or quick driver checks without the ESP32-S3-BOX-3.
   the full driver). Bench scripts `running_test_z.py` / `running_test_xz.py`
   at the repo root import `from mks_motor import MKSMotor`.
 - `mks_motor_oldver.py` is an older backup, kept for history; not imported.
-- Scope: **L0/L1 only** (driver + single-cell bench tests). No L2+
-  composition is built here.
+- Scope: **L0 (driver) only** — no L1 server, no L2 ESP UI. (Level = code
+  depth; see CommonClaude's `ARCHITECTURE.md`.)
 
 ## Relationship to ESP32S3BOX3MotorController
 
