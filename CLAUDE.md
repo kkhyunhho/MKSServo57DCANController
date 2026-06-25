@@ -2,184 +2,51 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Overview
+## Conventions
 
-This is a conventions repository that defines project-wide standards for Claude Code sessions. The primary artifact is `CommonClaude.md`.
+For the big picture and all shared conventions — the "one cell, many
+devices" architecture, code style, repo skeleton, codename naming, the
+shared conda env, testing, and task/commit rules — see **CommonClaude**
+(`kkhyunhho/CommonClaude`), the single source of truth. Where this file is
+silent, CommonClaude governs.
 
-## Environment
+(The local [`CommonClaude.md`](CommonClaude.md) here is the **historical
+origin** of that ruleset, kept for reference; the canonical, maintained
+copy is `kkhyunhho/CommonClaude`.)
 
-This project runs inside a **Docker container** with [Claude Code](https://claude.ai/code) as the primary development tool.
+## What this project is
 
-| Item              | Detail                                         |
-|-------------------|-------------------------------------------------|
-| Runtime           | Docker container (`--privileged`)               |
-| OS                | Ubuntu 24.04 (Noble)                            |
-| Dev tool          | Claude Code (CLI / VS Code extension)           |
+A **standalone single-axis MKS SERVO57D CAN test harness** — the original
+MKSMotor test bed. It drives the motor over a USB2CAN (FTDI) adapter with
+**no ESP32 firmware and no touch UI**, which is exactly why it is kept:
+for bench situations where the full stack is unwanted — e.g. testing a
+single axis, or quick driver checks without the ESP32-S3-BOX-3.
 
-## 1. MIT Code Convention
+- Driver: [src/mks_motor/](src/mks_motor/), class `MKSMotor` (simpler than
+  the full driver). Bench scripts `running_test_z.py` / `running_test_xz.py`
+  at the repo root import `from mks_motor import MKSMotor`.
+- `mks_motor_oldver.py` is an older backup, kept for history; not imported.
+- Scope: **L0/L1 only** (driver + single-cell bench tests). No L2+
+  composition is built here.
 
-All code follows the [MIT CommLab Coding and Comment Style](https://mitcommlab.mit.edu/broad/commkit/coding-and-comment-style/).
+## Relationship to ESP32S3BOX3MotorController
 
-### Naming
+That project holds the **full, more correct** MKS driver (paired-axis
+safety interlock, better limit logic, the ESP32 firmware bridge). This
+harness's limit logic **lags** it and should be **aligned to the ESP32
+version later** (the two are intended to converge).
 
-- **Variables and classes** are nouns; **functions and methods** are verbs.
-- Names must be pronounceable and straightforward.
-- Name length is proportional to scope: short for local, descriptive for broad.
-- Avoid abbreviations unless self-explanatory. If unavoidable, define them in a comment block.
-- Python conventions:
+**Import-name collision:** both expose the package `mks_motor`, so they are
+**not co-installed** in the shared `elec` env (where the ESP32 driver
+lives). Run this harness standalone — from an isolated env, or with
+`PYTHONPATH=src python running_test_z.py`. Its distribution name is
+`mks_motor_standalone` to keep that distinction explicit.
 
-| Element    | Style        | Example               |
-|------------|--------------|-----------------------|
-| Variable   | `lower_case` | `joint_angle`         |
-| Function   | `lower_case` | `send_action`         |
-| Class      | `CamelCase`  | `FairinoFollower`     |
-| Constant   | `lower_case` | `_settle_mid_s`       |
-| Module     | `lowercase`  | `fairino_follower`    |
+## Hardware notes
 
-### Structure
-
-- **80-column limit** for all new code.
-- One statement per line.
-- Indent with **4 spaces** (never tabs).
-- Place operators on the **left side** of continuation lines so the reader can see at a glance that a line continues.
-- Group related items visually with alignment.
-
-### Spacing
-
-- One space after commas, none before: `foo(a, b, c)`.
-- One space on each side of `=`, `==`, `<`, `>`, etc.
-- Be consistent with arithmetic operators within a file.
-
-### Comments
-
-- Use **complete sentences**.
-- Only comment for **context** or **non-obvious choices**. Never restate what the code already says.
-- Outdated comments are worse than none. Keep them current or delete them.
-- TODO format:
-  ```python
-  # TODO: (@owner) Implement 2-step predictor-corrector
-  # for stability. Adams-Bashforth causes shocks.
-  ```
-
-### Language
-
-- All code comments, docstrings, commit messages, documentation files (including README), **GitHub issues, and pull requests** must be written in **English**.
-
-### Documentation
-
-- All public functions and classes must have **docstrings** (PEP 257 / Google style).
-- A docstring states **what** and **why**, not **how**.
-- Include `Args:`, `Returns:`, and `Raises:` sections when applicable.
-
----
-
-## 2. Debug File Management
-
-All debug, exploratory, and throwaway test scripts must be saved in `claude_test/`, **not** in `tests/`.
-
-### Rules
-
-| Location        | What goes there                                      |
-|-----------------|------------------------------------------------------|
-| `tests/`        | Production-quality tests that are part of CI/CD.     |
-| `claude_test/`  | Debug scripts, one-off experiments, diagnostic code. |
-
-### When writing debug code
-
-1. Create the file directly in `claude_test/` (e.g., `claude_test/debug_servo_timing.py`).
-2. Add a one-line docstring at the top explaining the purpose.
-3. If the debug script leads to a real fix, move the relevant parts into a proper test under `tests/` and delete or archive the debug version.
-
-### README
-
-`claude_test/README.md` is the index. When adding a new debug file, add a row to the table in that README describing what the file does and what was learned.
-
----
-
-## 3. Task Management
-
-> **MANDATORY**: This workflow applies to **every task without exception**, regardless of size or complexity. No task may begin without writing `ToDo.md` and creating a GitHub issue via `gh`. Skipping any step is not allowed.
-
-### Rules
-
-1. **Write ToDo.md**: For every task requested by the user, create a `ToDo.md` file and confirm the contents with the user before starting work.
-2. **Accumulate ToDo.md**: Do not overwrite previous entries in `ToDo.md`. Always **append** new tasks below existing ones so that the file serves as a cumulative command history for Claude's actions.
-3. **Register GitHub issues**: When possible, use the `gh` CLI to register the Todo list and details as a GitHub issue.
-
-### Command Input Validation
-
-Before writing ToDo.md, the following two checks must be performed:
-
-1. **Is the command explicit?**: If the request is ambiguous or open to interpretation, do not start work. Instead, ask the user for specifics:
-   - What is being changed? (target)
-   - How is it being changed? (method)
-   - Why is it being changed? (purpose)
-2. **Are there reference materials?**: Check whether related PDFs, websites, or documents exist. If so, review them before incorporating into the work.
-
-> Do not proceed if either check is not satisfied.
-
-### Workflow
-
-1. Receive the user's task request and **validate the command input**.
-2. Once validated, organize the task list in `ToDo.md`.
-3. Get the user's confirmation on the `ToDo.md` contents.
-4. Once confirmed, create a GitHub issue via `gh issue create`.
-5. Check off completed items in `ToDo.md` as work progresses.
-6. Update the GitHub issue via `gh issue edit` for completed items.
-7. **Commit and push** changes after every user command is completed.
-
-> **Reminder**: Steps 2 (`ToDo.md`) and 4 (`gh issue create`) are **non-negotiable**. Every task must have a corresponding `ToDo.md` entry and a GitHub issue before any work begins.
-
----
-
-## 4. Testing Rules
-
-Tests exist to verify the **correctness and quality** of code. Code quality must never be sacrificed just to pass tests.
-
-### Rules
-
-1. **No magic numbers**: Do not use arbitrary numbers or values directly to pass tests. All values must be defined as meaningful constants or variables.
-   ```python
-   # Bad: passing tests with magic numbers
-   def calculate_area(radius):
-       return 3.14 * radius * radius  # Why 3.14?
-
-   # Good: use meaningful constants
-   import math
-
-   def calculate_area(radius):
-       return math.pi * radius * radius
-   ```
-
-2. **No hardcoding**: Do not hardcode values to match expected test results. Code must work through correct logic, not through branches or fixed values tailored to specific inputs.
-   ```python
-   # Bad: hardcoded to match test inputs
-   def convert_temperature(celsius):
-       if celsius == 100:
-           return 212
-       if celsius == 0:
-           return 32
-       return celsius * 1.8 + 32
-
-   # Good: correct logic implementation
-   def convert_temperature(celsius):
-       return celsius * 1.8 + 32
-   ```
-
-3. **Code quality first**: Prioritize readability, maintainability, and correctness over whether tests pass. If a test fails, fix the logic correctly rather than tricking the test.
-
----
-
-## 5. Linting
-
-All Python code must pass **Ruff** checks before committing.
-
-### Rules
-
-1. **Line length**: 80 columns (`line-length = 80` in `ruff.toml`).
-2. **Run on every commit**: Before committing, run:
-   ```bash
-   ruff check <file>.py
-   ruff format --check <file>.py
-   ```
-3. **Fix before committing**: If either command reports errors, fix them before proceeding. Use `ruff format <file>.py` to auto-format.
+MKS SERVO57D over a USB2CAN **FTDI** adapter (`0403:6001`). This older
+harness uses the **`ftd2xx`** D2XX bindings (not pyftdi — that is the full
+ESP32 driver). Adapters are identified by **FTDI serial number** (FTDI
+exposes unique serials). On Linux, D2XX needs the in-kernel `ftdi_sio`
+driver detached for the FTDI device; the container's `/dev` is a private
+tmpfs so USB nodes also go stale after re-enumeration — see [README.md](README.md).
