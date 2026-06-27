@@ -6,13 +6,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 For the big picture and all shared conventions — the "one cell, many
 devices" architecture, code style, repo skeleton, codename naming, the
-shared conda env, testing, and task/commit rules — see **CommonClaude**
-(`kkhyunhho/CommonClaude`), the single source of truth. Where this file is
-silent, CommonClaude governs.
+shared conda env, testing, and task/commit rules — see **SDLClaude**
+(`kkhyunhho/SDLClaude`), the single source of truth. Where this file is
+silent, SDLClaude governs.
 
-(The local [`CommonClaude.md`](CommonClaude.md) here is the **historical
+(The local [`SDLClaude.md`](SDLClaude.md) here is the **historical
 origin** of that ruleset, kept for reference; the canonical, maintained
-copy is `kkhyunhho/CommonClaude`.)
+copy is `kkhyunhho/SDLClaude`.)
 
 ## What this project is
 
@@ -27,7 +27,7 @@ single axis, or quick driver checks without the ESP32-S3-BOX-3.
   at the repo root import `from mks_motor import MKSMotor`.
 - `mks_motor_oldver.py` is an older backup, kept for history; not imported.
 - Scope: **L0 (driver) only** — no L1 server, no L2 ESP UI. (Level = code
-  depth; see CommonClaude's `ARCHITECTURE.md`.)
+  depth; see SDLClaude's `ARCHITECTURE.md`.)
 
 ## Relationship to ESP32S3BOX3MotorController
 

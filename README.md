@@ -116,7 +116,7 @@ called on a motor object (e.g. `motor.setup()`).
 mks_motor/
 ├── mks_motor.py       # MKSMotor class (library)
 ├── running_test.py    # Test script for dual motors
-├── CommonClaude.md    # Project conventions
+├── SDLClaude.md    # Project conventions
 └── README.md          # This file
 ```
 
