@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 # Standalone test-harness variant of the MKS driver. Shares the import
 # name `mks_motor` with ESP32S3BOX3MotorController's driver, so the two
-# are NOT co-installed in the shared `elec` env — run this one from an
+# are NOT co-installed in the shared `sdl` env — run this one from an
 # isolated env or via `PYTHONPATH=src` (see CLAUDE.md).
 name = "mks_motor_standalone"
 version = "0.1.0"

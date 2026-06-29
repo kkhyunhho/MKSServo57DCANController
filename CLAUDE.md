@@ -36,7 +36,7 @@ harness's limit logic **lags** it and should be **aligned to the ESP32
 version later** (the two are intended to converge).
 
 **Import-name collision:** both expose the package `mks_motor`, so they are
-**not co-installed** in the shared `elec` env (where the ESP32 driver
+**not co-installed** in the shared `sdl` env (where the ESP32 driver
 lives). Run this harness standalone — from an isolated env, or with
 `PYTHONPATH=src python running_test_z.py`. Its distribution name is
 `mks_motor_standalone` to keep that distinction explicit.
